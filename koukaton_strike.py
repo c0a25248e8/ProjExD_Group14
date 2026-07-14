@@ -3,19 +3,9 @@ import os
 import sys
 import pygame as pg
 
-# --- 定数定義 ---
-WIDTH = 1100   # ゲームウィンドウの幅
-HEIGHT = 650   # ゲームウィンドウの高さ
-FPS = 50       # フレームレート
+WIDTH = 1100  # ゲームウィンドウの幅
+HEIGHT = 650  # ゲームウィンドウの高さ
 
-# カラー定義
-COLOR_WHITE = (255, 255, 255)
-COLOR_RED = (255, 0, 0)
-COLOR_BLUE = (0, 0, 255)
-COLOR_GREEN = (0, 255, 0)
-COLOR_YELLOW = (255, 255, 0)
-
-# カレントディレクトリをスクリプトの場所に合わせる
 ENEMY_LIMIT = 5  # 通常敵を何体出したらボスに移るか
 NORMAL_ENEMY_TIME = 12_000  # 通常敵1体あたりの制限時間[ms]
 BOSS_TIME = 35_000  # ボスの制限時間[ms]
@@ -23,7 +13,8 @@ BOSS_TIME = 35_000  # ボスの制限時間[ms]
 WATER_BALL_SPEED = 5  # 水の球の速度
 WATER_DAMAGE = 1  # 水の球に当たった時のダメージ
 
-PLAYER_MAX_HP = 5  # こうかとんのHP
+PLAYER_MAX_HP = 100  # こうかとんのHP
+
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -39,6 +30,55 @@ def check_bound(obj_rct: pg.Rect) -> tuple[int, int]:
     return yoko, tate
 
 
+class PlayerHealth:
+    """
+    2匹のこうかとんで共有するHPを管理するクラス。
+    水球による連続ダメージ防止も共通で管理する。
+    """
+
+    def __init__(
+        self,
+        max_hp: int = PLAYER_MAX_HP,
+        damage_interval: int = 900,
+    ):
+        self.max_hp = max_hp
+        self.hp = max_hp
+        self.damage_interval = damage_interval
+        self.last_damage_time = -damage_interval
+
+    def damage(self, amount: int) -> bool:
+        """共通HPを減らす。確認用キーには依存しない。"""
+        if amount <= 0 or self.hp <= 0:
+            return False
+
+        self.hp = max(0, self.hp - amount)
+        return True
+
+    def take_damage(self, amount: int) -> bool:
+        """無敵時間を確認してから共通HPを減らす。"""
+        now = pg.time.get_ticks()
+        if now - self.last_damage_time < self.damage_interval:
+            return False
+
+        if not self.damage(amount):
+            return False
+
+        self.last_damage_time = now
+        return True
+
+    def heal(self, amount: int) -> bool:
+        """共通HPを回復し、最大HPを超えないようにする。"""
+        if amount <= 0 or self.hp >= self.max_hp:
+            return False
+
+        self.hp = min(self.max_hp, self.hp + amount)
+        return True
+
+    def is_dead(self) -> bool:
+        """共通HPが0以下かを返す。"""
+        return self.hp <= 0
+
+
 class Bird(pg.sprite.Sprite):
     """
     ゲームキャラクター（こうかとん）に関するクラス
@@ -46,31 +86,56 @@ class Bird(pg.sprite.Sprite):
 
     def __init__(self, num: int, xy: tuple[int, int], name: str):
         super().__init__()
-        self.name = name  # 識別用の名前
+        self.name = name
         self.base_img = pg.transform.rotozoom(pg.image.load(f"fig/{num}.png"), 0, 1.2)
         self.image = self.base_img
-        self.rect = self.image.get_rect(center=xy)
+        self.rect = self.image.get_rect()
+        self.rect.center = xy
 
-        # 移動・物理パラメータ
         self.vx = 0.0
         self.vy = 0.0
         self.friction = 0.98
 
-        # ドラッグ・発射管理
         self.is_dragging = False
         self.max_drag_dist = 200
         self.has_shot = False
-        self.has_triggered_combo = False  
+        self.has_triggered_combo = False
 
-        self.hp = PLAYER_MAX_HP
+        # 単独利用時は従来どおり個別HPとして動作する。
+        # main()で同じPlayerHealthを設定すると2匹共通HPになる。
+        self._hp = PLAYER_MAX_HP
+        self.shared_health: PlayerHealth | None = None
         self.last_damage_time = 0
-        self.damage_interval = 900  # 連続ダメージ防止時間[ms]
+        self.damage_interval = 900  # 個別HP利用時の連続ダメージ防止時間[ms]
+
+    @property
+    def hp(self) -> int:
+        """共有HPが設定されている場合は、その現在値を返す。"""
+        if self.shared_health is not None:
+            return self.shared_health.hp
+        return self._hp
+
+    @hp.setter
+    def hp(self, value: int) -> None:
+        """既存コードからのhp代入にも対応する。"""
+        value = max(0, int(value))
+        if self.shared_health is not None:
+            self.shared_health.hp = min(self.shared_health.max_hp, value)
+        else:
+            self._hp = value
+
+    def set_shared_health(self, health: PlayerHealth) -> None:
+        """2匹で共有するPlayerHealthを設定する。"""
+        self.shared_health = health
 
     def take_damage(self, damage: int) -> bool:
         """
         水の球に当たったときにダメージを受ける。
-        短時間に連続でダメージを受けないようにする。
+        共有HP設定時は、2匹共通の無敵時間とHPを使用する。
         """
+        if self.shared_health is not None:
+            return self.shared_health.take_damage(damage)
+
         now = pg.time.get_ticks()
         if now - self.last_damage_time < self.damage_interval:
             return False
@@ -79,36 +144,58 @@ class Bird(pg.sprite.Sprite):
         self.last_damage_time = now
         return True
 
-        self.has_triggered_combo = False  # [追加]このターンに愛情コンボを発動したか
+    def damage(self, amount: int) -> bool:
+        """このこうかとん経由で共有HPにダメージを与える。"""
+        if self.shared_health is not None:
+            return self.shared_health.damage(amount)
+
+        if amount <= 0 or self.hp <= 0:
+            return False
+        self.hp = max(0, self.hp - amount)
+        return True
+
+    def heal(self, amount: int) -> bool:
+        """共有HP、または個別HPを回復する。"""
+        if self.shared_health is not None:
+            return self.shared_health.heal(amount)
+
+        if amount <= 0 or self.hp >= PLAYER_MAX_HP:
+            return False
+        self.hp = min(PLAYER_MAX_HP, self.hp + amount)
+        return True
+
+    def is_dead(self) -> bool:
+        """共有HP、または個別HPが0以下かを返す。"""
+        return self.hp <= 0
 
     def update(self, screen: pg.Surface, is_my_turn: bool):
         """
-        こうかとんの移動、壁での跳ね返り、およびガイドライン・ターン目印の描画
+        こうかとんの移動、壁での跳ね返り、および自分のターン時のドラッグ矢印描画
         """
         if not self.is_dragging:
-            # 移動処理
             self.rect.move_ip(self.vx, self.vy)
 
-            # 壁との衝突・めり込み防止処理
             yoko, tate = check_bound(self.rect)
             if yoko == -1:
                 self.vx *= -1
-                self.rect.left = max(0, self.rect.left)
-                self.rect.right = min(WIDTH, self.rect.right)
+                if self.rect.left < 0:
+                    self.rect.left = 0
+                if self.rect.right > WIDTH:
+                    self.rect.right = WIDTH
+
             if tate == -1:
                 self.vy *= -1
-                self.rect.top = max(0, self.rect.top)
-                self.rect.bottom = min(HEIGHT, self.rect.bottom)
+                if self.rect.top < 0:
+                    self.rect.top = 0
+                if self.rect.bottom > HEIGHT:
+                    self.rect.bottom = HEIGHT
 
-            # 摩擦による減速
             self.vx *= self.friction
             self.vy *= self.friction
-            
-            # 完全停止判定
+
             if math.hypot(self.vx, self.vy) < 0.1:
                 self.vx, self.vy = 0.0, 0.0
 
-        # ドラッグ中のガイドライン描画
         if is_my_turn and self.is_dragging:
             mouse_pos = pg.mouse.get_pos()
             dx = mouse_pos[0] - self.rect.centerx
@@ -118,23 +205,21 @@ class Bird(pg.sprite.Sprite):
             if dist > self.max_drag_dist:
                 dx = (dx / dist) * self.max_drag_dist
                 dy = (dy / dist) * self.max_drag_dist
-            
-            # 引っ張る方向とは逆（飛んでいく方向）への赤い矢印（線）
+
             target_x = self.rect.centerx - dx
             target_y = self.rect.centery - dy
-            pg.draw.line(screen, COLOR_RED, self.rect.center, (target_x, target_y), 5)
-            
-            # マウスで引っ張っている方向への青い線と丸
+
+            pg.draw.line(screen, (255, 0, 0), self.rect.center, (target_x, target_y), 5)
+
             current_drag_x = self.rect.centerx + dx
             current_drag_y = self.rect.centery + dy
-            pg.draw.line(screen, COLOR_BLUE, self.rect.center, (current_drag_x, current_drag_y), 2)
-            pg.draw.circle(screen, COLOR_BLUE, (int(current_drag_x), int(current_drag_y)), 8)
+            pg.draw.line(screen, (0, 0, 255), self.rect.center, (current_drag_x, current_drag_y), 2)
+            pg.draw.circle(screen, (0, 0, 255), (int(current_drag_x), int(current_drag_y)), 8)
 
-        # キャラクターの描画
         screen.blit(self.image, self.rect)
 
         if is_my_turn:
-            pg.draw.circle(screen, COLOR_YELLOW, self.rect.center, self.rect.width // 2 + 5, 2)
+            pg.draw.circle(screen, (255, 255, 0), self.rect.center, self.rect.width // 2 + 5, 2)
 
 
 class Enemy(pg.sprite.Sprite):
@@ -143,41 +228,33 @@ class Enemy(pg.sprite.Sprite):
     制限時間が切れても消えず、次の敵を追加スポーンさせる対象になる。
     """
 
-    def __init__(
-        self,
-        xy: tuple[int, int],
-        hp: int = 5,
-        time_limit: int = NORMAL_ENEMY_TIME,
-    ):
+    def __init__(self, xy: tuple[int, int], hp: int = 5, time_limit: int = NORMAL_ENEMY_TIME):
         super().__init__()
-
-        self.image = pg.transform.rotozoom(
-            pg.image.load("fig/suraimu.png"),
-            0,
-            0.2,
-        )
-        self.rect = self.image.get_rect(center=xy)
+        self.image = pg.transform.rotozoom(pg.image.load("fig/suraimu.png"), 0, 0.2)
+        self.rect = self.image.get_rect()
+        self.rect.center = xy
 
         self.max_hp = hp
         self.hp = self.max_hp
 
-        # 敵の無敵時間タイマー
-        self.muteki_time = 0  # 0より大きいときは無敵状態
+        # 多段ヒット防止用の無敵時間タイマー
+        self.muteki_time = 0
 
         self.time_limit = time_limit
         self.spawn_time = pg.time.get_ticks()
-        self.is_time_checked = False
+        self.is_time_checked = False  # 時間切れ処理を1回だけ行うためのフラグ
 
         self.last_hit_time = 0
-        self.hit_interval = 450
+        self.hit_interval = 450  # 連続ヒットによるHPの急減を防ぐ
 
     def can_take_damage(self) -> bool:
         """
         直近のダメージから一定時間経過していればTrueを返す
         """
         now = pg.time.get_ticks()
-        if now - self.last_hit_time >= self.hit_interval:
+        if self.muteki_time == 0 and now - self.last_hit_time >= self.hit_interval:
             self.last_hit_time = now
+            self.muteki_time = 25
             return True
         return False
 
@@ -195,28 +272,30 @@ class Enemy(pg.sprite.Sprite):
         return self.get_remaining_time() <= 0
 
     def update(self, screen: pg.Surface) -> None:
-        """
-        敵を描画する。
-        HPバーは別担当のため、ここでは描画しない。
-        """
-        #---追加：敵の無敵時間タイマー---
+        """敵を描画し、無敵時間とHPバーを更新する。"""
         if self.muteki_time > 0:
             self.muteki_time -= 1
 
         screen.blit(self.image, self.rect)
 
-        # HPバーの描画
         if self.hp > 0:
-            bar_width = 30  
+            bar_width = 30
             bar_height = 5
             bar_x = self.rect.centerx - bar_width // 2
-            bar_y = self.rect.top - 8  
-            
-            # 背景（赤）
-            pg.draw.rect(screen, COLOR_RED, (bar_x, bar_y, bar_width, bar_height))
-            # 残りHP（緑）
+            bar_y = self.rect.top - 8
+
+            pg.draw.rect(
+                screen,
+                (255, 0, 0),
+                (bar_x, bar_y, bar_width, bar_height),
+            )
             hp_ratio = self.hp / self.max_hp
-            pg.draw.rect(screen, COLOR_GREEN, (bar_x, bar_y, int(bar_width * hp_ratio), bar_height))
+            pg.draw.rect(
+                screen,
+                (0, 255, 0),
+                (bar_x, bar_y, int(bar_width * hp_ratio), bar_height),
+            )
+
 
 class Boss(Enemy):
     """
@@ -231,11 +310,8 @@ class Boss(Enemy):
         self.hit_interval = 350
 
     def update(self, screen: pg.Surface) -> None:
-        """
-        ボスを描画する。
-        HPバーは別担当のため、ここでは描画しない。
-        """
-        screen.blit(self.image, self.rect)
+        """ボスとHPバーを描画する。"""
+        super().update(screen)
 
 
 class WaterBall(pg.sprite.Sprite):
@@ -359,6 +435,25 @@ class Spark:
         return self.life > 0
 
 
+class HitEffect(pg.sprite.Sprite):
+    """衝突時に短時間表示する画像エフェクト。"""
+
+    def __init__(self, xy: tuple[int, int]):
+        super().__init__()
+        original_img = pg.image.load("fig/hit.png")
+        self.image = pg.transform.rotozoom(original_img, 0, 0.2)
+        self.rect = self.image.get_rect(center=xy)
+        self.lifetime = 10
+
+    def update(self, screen: pg.Surface) -> None:
+        """エフェクトを描画し、寿命が切れたら削除する。"""
+        if self.lifetime > 0:
+            screen.blit(self.image, self.rect)
+            self.lifetime -= 1
+        else:
+            self.kill()
+
+
 def create_enemy(enemy_count: int) -> Enemy:
     """
     何体目の敵かに応じて、敵の出現位置とHPを変えて生成する
@@ -463,30 +558,99 @@ def enemy_attack_once(
         water_balls.add(WaterBall(en.rect.center, target_bird.rect.center))
 
 
+def stop_birds(birds: list[Bird]) -> None:
+    """ゲーム終了時に2匹の移動と操作状態を停止する。"""
+    for bird in birds:
+        bird.vx = 0.0
+        bird.vy = 0.0
+        bird.is_dragging = False
+        bird.has_shot = False
+        bird.has_triggered_combo = False
 
-class HitEffect(pg.sprite.Sprite):
-    """
-    衝突時に一瞬だけ表示されるエフェクト
-    """
 
-    def __init__(self, xy: tuple[int,int]):
-        super().__init__()
-        a_image = pg.image.load("fig/hit.png")
-        self.image = pg.transform.rotozoom(a_image, 0, 0.2)
-        self.rect = self.image.get_rect()
-        self.rect.center = xy
+def draw_player_hp(
+    screen: pg.Surface,
+    player_health: PlayerHealth,
+    x: int,
+    y: int,
+    font: pg.font.Font,
+) -> None:
+    """2匹共通のHPゲージを描画する。"""
+    bar_width = 260
+    bar_height = 18
+    hp_ratio = player_health.hp / player_health.max_hp
 
-        self.lifetime = 10 #ほかのエフェクトに被るようならここを変更
+    hp_text = font.render(
+        f"共通HP: {player_health.hp}/{player_health.max_hp}",
+        True,
+        (255, 255, 255),
+    )
+    screen.blit(hp_text, (x, y))
 
-    def update(self, screen: pg.Surface):
-        """
-        エフェクトを表示し、寿命が来たら自身を削除する
-        """
-        if self.lifetime > 0:
-            screen.blit(self.image, self.rect)
-            self.lifetime -= 1
-        else:
-            self.kill()
+    bar_y = y + 28
+    pg.draw.rect(
+        screen,
+        (70, 70, 70),
+        (x, bar_y, bar_width, bar_height),
+    )
+    pg.draw.rect(
+        screen,
+        (220, 40, 40),
+        (x, bar_y, bar_width, bar_height),
+        2,
+    )
+
+    if player_health.hp <= 0:
+        return
+
+    if hp_ratio > 0.5:
+        hp_color = (40, 210, 70)
+    elif hp_ratio > 0.2:
+        hp_color = (240, 190, 30)
+    else:
+        hp_color = (230, 50, 50)
+
+    pg.draw.rect(
+        screen,
+        hp_color,
+        (x, bar_y, int(bar_width * hp_ratio), bar_height),
+    )
+
+
+def draw_result_screen(
+    screen: pg.Surface,
+    result: str,
+    title_font: pg.font.Font,
+    guide_font: pg.font.Font,
+) -> None:
+    """ゲームクリアまたはゲームオーバー画面を描画する。"""
+    overlay = pg.Surface((WIDTH, HEIGHT), pg.SRCALPHA)
+    overlay.fill((0, 0, 0, 180))
+    screen.blit(overlay, (0, 0))
+
+    if result == "clear":
+        title = "GAME CLEAR!"
+        title_color = (255, 230, 70)
+    else:
+        title = "GAME OVER"
+        title_color = (255, 80, 80)
+
+    title_img = title_font.render(title, True, title_color)
+    guide_img = guide_font.render(
+        "Rキー：もう一度遊ぶ　Qキー：終了",
+        True,
+        (255, 255, 255),
+    )
+
+    screen.blit(
+        title_img,
+        title_img.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 45)),
+    )
+    screen.blit(
+        guide_img,
+        guide_img.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 35)),
+    )
+
 
 def main():
     pg.display.set_caption("こうかとんストライク（2人交互ターン制）")
@@ -494,28 +658,33 @@ def main():
     bg_img = pg.image.load("fig/senjou.png")
     font = pg.font.SysFont("hgp創英角ﾎﾟｯﾌﾟ体", 30)
     small_font = pg.font.SysFont("hgp創英角ﾎﾟｯﾌﾟ体", 24)
+    result_font = pg.font.SysFont("hgp創英角ﾎﾟｯﾌﾟ体", 72)
+    guide_font = pg.font.SysFont("hgp創英角ﾎﾟｯﾌﾟ体", 28)
 
     pg.mixer.music.load("bgm.mp3")
     pg.mixer.music.play(loops=-1)
 
-    # プレイヤー（こうかとん）の初期化
     birds = [
-        Bird(3, (WIDTH // 4, HEIGHT // 3), "プレイヤー1"),   
-        Bird(1, (WIDTH // 4, HEIGHT * 2 // 3), "プレイヤー2") 
+        Bird(3, (WIDTH // 4, HEIGHT // 3), "プレイヤー1"),
+        Bird(1, (WIDTH // 4, HEIGHT * 2 // 3), "プレイヤー2"),
     ]
-    turn_idx = 0  # 現在のターンインデックス
-    
-    # 敵グループの初期化
+
+    # 2匹に同じPlayerHealthを設定するため、HPは共通になる。
+    player_health = PlayerHealth(max_hp=PLAYER_MAX_HP)
+    for bird in birds:
+        bird.set_shared_health(player_health)
+
+    turn_idx = 0
+
     enemies = pg.sprite.Group()
     water_balls = pg.sprite.Group()
-    #---追加: エフェクトのグループ---
     effects = pg.sprite.Group()
 
     enemy_count = 0
     boss_spawned = False
     game_clear = False
+    game_result: str | None = None
     message = ""
-    score = 0
 
     enemy_count, boss_spawned, message = spawn_next_enemy(
         enemies,
@@ -526,42 +695,40 @@ def main():
 
     walls = create_walls()
     sparks: list[Spark] = []
-
-    
-
-    enemy = Enemy((WIDTH * 3 // 4, HEIGHT // 4))
-    enemies.add(enemy)
-    # ビームのエフェクトを管理するリスト [始点, 終点, 残り表示フレーム数]
-
-    beams = []
-
+    beams: list[list] = []
+    score = 0
 
     clock = pg.time.Clock()
-   
+
     while True:
-        current_bird = birds[turn_idx]  # 現在のターンのこうかとん
-        
-        # --- 1. イベント処理 ---
+        current_bird = birds[turn_idx]
+
         for event in pg.event.get():
             if event.type == pg.QUIT:
                 pg.mixer.music.stop()
                 return 0
+
             if game_clear:
+                if event.type == pg.KEYDOWN:
+                    if event.key == pg.K_r:
+                        return main()
+                    if event.key in (pg.K_q, pg.K_ESCAPE):
+                        pg.mixer.music.stop()
+                        return 0
                 continue
 
-            # マウスダウン: 引っぱりの開始（すでに発射済みなら反応しない）
-            if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
-                if current_bird.rect.collidepoint(event.pos) and not current_bird.has_shot:
-                    current_bird.is_dragging = True
-                    current_bird.vx, current_bird.vy = 0.0, 0.0
+            if event.type == pg.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    if current_bird.rect.collidepoint(event.pos) and not current_bird.has_shot:
+                        current_bird.is_dragging = True
+                        current_bird.vx, current_bird.vy = 0.0, 0.0
 
-            # マウスアップ: 発射
-            if event.type == pg.MOUSEBUTTONUP and event.button == 1:
-                if current_bird.is_dragging:
+            if event.type == pg.MOUSEBUTTONUP:
+                if event.button == 1 and current_bird.is_dragging:
                     current_bird.is_dragging = False
-                    current_bird.has_shot = True  # ★ここで確実に発射フラグを立てる
-                    
+                    current_bird.has_shot = True
                     mouse_pos = event.pos
+
                     dx = mouse_pos[0] - current_bird.rect.centerx
                     dy = mouse_pos[1] - current_bird.rect.centery
                     dist = math.hypot(dx, dy)
@@ -569,73 +736,110 @@ def main():
                     if dist > current_bird.max_drag_dist:
                         dx = (dx / dist) * current_bird.max_drag_dist
                         dy = (dy / dist) * current_bird.max_drag_dist
-                    
-                    # ひっぱった方向の逆へ飛ばす
+
                     current_bird.vx = -dx * 0.25
                     current_bird.vy = -dy * 0.25
 
-        # --- 2. 味方同士の衝突判定（愛情コンボ） ---
-        # ※イベントループの外（インデントはwhileと同じレベル）で毎フレーム監視
-        if current_bird.has_shot and not current_bird.has_triggered_combo:
-            other_bird = birds[1] if turn_idx == 0 else birds[0]
-            if current_bird.rect.colliderect(other_bird.rect):
-                current_bird.has_triggered_combo = True
-                current_bird.vx *= -0.5
-                current_bird.vy *= -0.5
-                for en in enemies:
-                    en.hp -= 2
-                    beams.append([other_bird.rect.center, en.rect.center, 12])
-                    if en.hp <= 0:
-                        en.kill()
-
-        # --- 3. ゲームの状況更新ロジック（イベントループの外） ---
         if not game_clear:
-            
-            #【絶対確実なターン切り替え】
-            # 発射されていて、かつ速度がほぼ0になったら交代
-            if current_bird.has_shot and math.hypot(current_bird.vx, current_bird.vy) < 0.1:
-                current_bird.vx, current_bird.vy = 0.0, 0.0 # 完全に止める
-                
-                # 敵の反撃
+            # 味方同士の衝突判定（愛情コンボ）
+            if current_bird.has_shot and not current_bird.has_triggered_combo:
+                other_bird = birds[1] if turn_idx == 0 else birds[0]
+                if current_bird.rect.colliderect(other_bird.rect):
+                    current_bird.has_triggered_combo = True
+                    current_bird.vx *= -0.5
+                    current_bird.vy *= -0.5
+
+                    for en in list(enemies):
+                        en.hp -= 2
+                        score += 200
+                        beams.append([other_bird.rect.center, en.rect.center, 12])
+                        sparks.append(Spark(en.rect.center))
+                        effects.add(HitEffect(en.rect.center))
+
+                        if en.hp <= 0:
+                            defeated_boss = isinstance(en, Boss)
+                            en.kill()
+                            score += 500
+
+                            if defeated_boss:
+                                game_clear = True
+                                game_result = "clear"
+                                message = "GAME CLEAR!"
+                                stop_birds(birds)
+                                pg.mixer.music.stop()
+                            else:
+                                message = "敵を倒した！"
+                                enemy_count, boss_spawned, message = spawn_next_enemy(
+                                    enemies,
+                                    enemy_count,
+                                    boss_spawned,
+                                    message,
+                                )
+
+            if current_bird.has_shot and current_bird.vx == 0.0 and current_bird.vy == 0.0:
+                # こうかとんの攻撃が1回終わったので、敵が1回だけ反撃する
                 enemy_attack_once(enemies, water_balls, current_bird)
-                
-                # フラグのリセットとターン交代
+
                 current_bird.has_shot = False
                 current_bird.has_triggered_combo = False
-                turn_idx = (turn_idx + 1) % len(birds) # 次のプレイヤーへ
-                continue # 交代したのでこのフレームの残りの判定はスキップ
+                turn_idx = (turn_idx + 1) % len(birds)
 
             # 敵の制限時間切れチェック
+            # 時間切れの敵は消さずに残し、次の敵を追加する
             for en in list(enemies):
                 if en.is_time_up() and not en.is_time_checked:
                     en.is_time_checked = True
                     message = "時間切れ！敵を残して次の敵を追加！"
                     enemy_count, boss_spawned, message = spawn_next_enemy(
-                        enemies, enemy_count, boss_spawned, message
+                        enemies,
+                        enemy_count,
+                        boss_spawned,
+                        message,
                     )
                     break
 
             # こうかとんと敵の衝突判定
             for bird in birds:
                 for en in list(enemies):
+                    # こうかとんが動いている時だけ、敵にダメージを与える
                     if bird.rect.colliderect(en.rect) and math.hypot(bird.vx, bird.vy) > 0.5:
                         if en.can_take_damage():
-                            en.hp -= 1
-                            score += 100
+                            damage = 1
+
+                            # ボスにも通常通りダメージを与える
+                            en.hp -= damage
+                            score += 100 * damage
                             message = f"敵にヒット！ 残りHP:{en.hp}"
                             sparks.append(Spark(en.rect.center))
                             effects.add(HitEffect(en.rect.center))
+
+                            # めり込みを戻してから、こうかとんを跳ね返す
                             bird.rect.move_ip(-bird.vx, -bird.vy)
                             bird.vx *= -0.5
                             bird.vy *= -0.5
+
+                            # HPが0以下になったら敵を倒す
                             if en.hp <= 0:
+                                defeated_boss = isinstance(en, Boss)
                                 en.kill()
                                 score += 500
-                                message = "敵を倒した！"
-                                enemy_count, boss_spawned, message = spawn_next_enemy(
-                                    enemies, enemy_count, boss_spawned, message
-                                )
-                        break
+
+                                if defeated_boss:
+                                    # ボスのHPが0になった場合だけゲームクリア。
+                                    game_clear = True
+                                    game_result = "clear"
+                                    message = "GAME CLEAR!"
+                                    stop_birds(birds)
+                                    pg.mixer.music.stop()
+                                else:
+                                    message = "敵を倒した！"
+                                    enemy_count, boss_spawned, message = spawn_next_enemy(
+                                        enemies,
+                                        enemy_count,
+                                        boss_spawned,
+                                        message,
+                                    )
+                            break
 
             # 水の球とこうかとんの衝突判定
             for water_ball in list(water_balls):
@@ -652,61 +856,85 @@ def main():
                     reflect_bird_by_wall(bird, wall)
                     sparks.append(Spark(bird.rect.center, life=10))
 
-            # ゲームオーバー判定
-            if all(bird.hp <= 0 for bird in birds):
+            # 2匹で共有するHPが0になったらゲームオーバー。
+            # 同一フレームで両方成立した場合はゲームオーバーを優先する。
+            if player_health.is_dead():
                 game_clear = True
+                game_result = "over"
                 message = "GAME OVER..."
+                stop_birds(birds)
+                pg.mixer.music.stop()
 
-        # --- 4. 描画処理 ---
-        screen.blit(bg_img, (0, 0))
+        screen.blit(bg_img, [0, 0])
+
         walls.update(screen)
 
         for i, bird in enumerate(birds):
-            bird.update(screen, is_my_turn=(i == turn_idx and not game_clear))
+            if game_clear:
+                screen.blit(bird.image, bird.rect)
+            else:
+                bird.update(screen, is_my_turn=(i == turn_idx))
 
         enemies.update(screen)
-        water_balls.update(screen)
-        effects.update(screen)
-        sparks = [spark for spark in sparks if spark.update(screen)]
+        if not game_clear:
+            water_balls.update(screen)
+            effects.update(screen)
+        else:
+            for water_ball in water_balls:
+                screen.blit(water_ball.image, water_ball.rect)
 
-        # 敵のHP表示
-        for en in enemies:
-            enemy_hp_text = small_font.render(f"HP:{en.hp}", True, (255, 255, 255))
-            screen.blit(enemy_hp_text, (en.rect.centerx - 25, en.rect.top - 25))
-
-        # 愛情コンボビームの更新と描画
+        # 愛情コンボのビームを描画する
         for beam in beams[:]:
             start_pos, end_pos, timer = beam
             pg.draw.line(screen, (255, 255, 0), start_pos, end_pos, 14)
             pg.draw.line(screen, (255, 255, 255), start_pos, end_pos, 4)
-            beam[2] -= 1
+            if not game_clear:
+                beam[2] -= 1
             if beam[2] <= 0:
                 beams.remove(beam)
 
-        # UIテキストの描画
-        turn_text = font.render(f"現在のターン: {birds[turn_idx].name}", True, (255, 255, 255))
+        for en in enemies:
+            enemy_hp_text = small_font.render(
+                f"HP:{en.hp}",
+                True,
+                (255, 255, 255),
+            )
+            screen.blit(enemy_hp_text, (en.rect.centerx - 25, en.rect.top - 25))
+
+        sparks = [spark for spark in sparks if spark.update(screen)]
+
+        turn_text = font.render(
+            f"現在のターン: {birds[turn_idx].name}",
+            True,
+            (255, 255, 255),
+        )
         screen.blit(turn_text, (20, 20))
 
         score_text = small_font.render(f"SCORE: {score}", True, (255, 255, 255))
         message_text = small_font.render(message, True, (255, 255, 0))
-        hp_text = small_font.render(f"P1 HP:{birds[0].hp}  P2 HP:{birds[1].hp}", True, (255, 255, 255))
-
         screen.blit(score_text, (20, 58))
         screen.blit(message_text, (20, 92))
-        screen.blit(hp_text, (20, 122))
+        draw_player_hp(screen, player_health, 20, 122, small_font)
 
         for idx, en in enumerate(enemies):
             remain_sec = en.get_remaining_time() / 1000
-            timer_text = small_font.render(f"敵{idx + 1}: {remain_sec:.1f}s", True, (255, 255, 255))
+            timer_text = small_font.render(
+                f"敵{idx + 1}: {remain_sec:.1f}s",
+                True,
+                (255, 255, 255),
+            )
             screen.blit(timer_text, (WIDTH - 180, 20 + idx * 28))
 
-        if game_clear:
-            result_text = "GAME OVER..." if message == "GAME OVER..." else "GAME CLEAR!"
-            clear_text = font.render(result_text, True, (255, 255, 0))
-            screen.blit(clear_text, clear_text.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+        if game_clear and game_result is not None:
+            draw_result_screen(
+                screen,
+                game_result,
+                result_font,
+                guide_font,
+            )
 
         pg.display.update()
-        clock.tick(FPS)
+        clock.tick(50)
 
 
 if __name__ == "__main__":
