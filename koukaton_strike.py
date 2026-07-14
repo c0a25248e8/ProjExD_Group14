@@ -60,6 +60,7 @@ class Bird(pg.sprite.Sprite):
         self.is_dragging = False
         self.max_drag_dist = 200
         self.has_shot = False
+        self.has_triggered_combo = False  
 
         self.hp = PLAYER_MAX_HP
         self.last_damage_time = 0
@@ -77,6 +78,8 @@ class Bird(pg.sprite.Sprite):
         self.hp = max(0, self.hp - damage)
         self.last_damage_time = now
         return True
+
+        self.has_triggered_combo = False  # [追加]このターンに愛情コンボを発動したか
 
     def update(self, screen: pg.Surface, is_my_turn: bool):
         """
@@ -505,11 +508,14 @@ def main():
     # 敵グループの初期化
     enemies = pg.sprite.Group()
     water_balls = pg.sprite.Group()
+    #---追加: エフェクトのグループ---
+    effects = pg.sprite.Group()
 
     enemy_count = 0
     boss_spawned = False
     game_clear = False
     message = ""
+    score = 0
 
     enemy_count, boss_spawned, message = spawn_next_enemy(
         enemies,
@@ -520,17 +526,22 @@ def main():
 
     walls = create_walls()
     sparks: list[Spark] = []
-    score = 0
 
-    #---追加: エフェクトのグループ---
-    effects = pg.sprite.Group()
+    
+
+    enemy = Enemy((WIDTH * 3 // 4, HEIGHT // 4))
+    enemies.add(enemy)
+    # ビームのエフェクトを管理するリスト [始点, 終点, 残り表示フレーム数]
+
+    beams = []
+
 
     clock = pg.time.Clock()
    
     while True:
         current_bird = birds[turn_idx]  # 現在のターンのこうかとん
         
-        # --- イベント処理 ---
+        # --- 1. イベント処理 ---
         for event in pg.event.get():
             if event.type == pg.QUIT:
                 pg.mixer.music.stop()
@@ -538,19 +549,17 @@ def main():
             if game_clear:
                 continue
 
-            # マウスダウン: 引っぱりの開始
+            # マウスダウン: 引っぱりの開始（すでに発射済みなら反応しない）
             if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
                 if current_bird.rect.collidepoint(event.pos) and not current_bird.has_shot:
                     current_bird.is_dragging = True
                     current_bird.vx, current_bird.vy = 0.0, 0.0
 
-            
-
             # マウスアップ: 発射
             if event.type == pg.MOUSEBUTTONUP and event.button == 1:
                 if current_bird.is_dragging:
                     current_bird.is_dragging = False
-                    current_bird.has_shot = True  
+                    current_bird.has_shot = True  # ★ここで確実に発射フラグを立てる
                     
                     mouse_pos = event.pos
                     dx = mouse_pos[0] - current_bird.rect.centerx
@@ -560,76 +569,72 @@ def main():
                     if dist > current_bird.max_drag_dist:
                         dx = (dx / dist) * current_bird.max_drag_dist
                         dy = (dy / dist) * current_bird.max_drag_dist
+                    
                     # ひっぱった方向の逆へ飛ばす
                     current_bird.vx = -dx * 0.25
                     current_bird.vy = -dy * 0.25
 
-        if not game_clear:
-            # 発射済みで、こうかとんが停止したらターンを切り替える
-            if (
-                current_bird.has_shot
-                and current_bird.vx == 0.0
-                and current_bird.vy == 0.0
-            ):
-                # 敵が現在のプレイヤーに向けて反撃する
-                enemy_attack_once(enemies, water_balls, current_bird)
+        # --- 2. 味方同士の衝突判定（愛情コンボ） ---
+        # ※イベントループの外（インデントはwhileと同じレベル）で毎フレーム監視
+        if current_bird.has_shot and not current_bird.has_triggered_combo:
+            other_bird = birds[1] if turn_idx == 0 else birds[0]
+            if current_bird.rect.colliderect(other_bird.rect):
+                current_bird.has_triggered_combo = True
+                current_bird.vx *= -0.5
+                current_bird.vy *= -0.5
+                for en in enemies:
+                    en.hp -= 2
+                    beams.append([other_bird.rect.center, en.rect.center, 12])
+                    if en.hp <= 0:
+                        en.kill()
 
+        # --- 3. ゲームの状況更新ロジック（イベントループの外） ---
+        if not game_clear:
+            
+            #【絶対確実なターン切り替え】
+            # 発射されていて、かつ速度がほぼ0になったら交代
+            if current_bird.has_shot and math.hypot(current_bird.vx, current_bird.vy) < 0.1:
+                current_bird.vx, current_bird.vy = 0.0, 0.0 # 完全に止める
+                
+                # 敵の反撃
+                enemy_attack_once(enemies, water_balls, current_bird)
+                
+                # フラグのリセットとターン交代
                 current_bird.has_shot = False
-                turn_idx = (turn_idx + 1) % len(birds)
+                current_bird.has_triggered_combo = False
+                turn_idx = (turn_idx + 1) % len(birds) # 次のプレイヤーへ
+                continue # 交代したのでこのフレームの残りの判定はスキップ
 
             # 敵の制限時間切れチェック
-            # 時間切れの敵は残し、次の敵を追加する
             for en in list(enemies):
                 if en.is_time_up() and not en.is_time_checked:
                     en.is_time_checked = True
                     message = "時間切れ！敵を残して次の敵を追加！"
-
                     enemy_count, boss_spawned, message = spawn_next_enemy(
-                        enemies,
-                        enemy_count,
-                        boss_spawned,
-                        message,
+                        enemies, enemy_count, boss_spawned, message
                     )
                     break
 
             # こうかとんと敵の衝突判定
             for bird in birds:
                 for en in list(enemies):
-                    # こうかとんが一定以上の速度で動いている場合のみ攻撃
-                    if (
-                        bird.rect.colliderect(en.rect)
-                        and math.hypot(bird.vx, bird.vy) > 0.5
-                    ):
+                    if bird.rect.colliderect(en.rect) and math.hypot(bird.vx, bird.vy) > 0.5:
                         if en.can_take_damage():
-                            damage = 1
-                            en.hp -= damage
-
-                            score += 100 * damage
+                            en.hp -= 1
+                            score += 100
                             message = f"敵にヒット！ 残りHP:{en.hp}"
-
-                            # 両方の衝突エフェクトを発生させる
                             sparks.append(Spark(en.rect.center))
                             effects.add(HitEffect(en.rect.center))
-
-                            # 当たったこうかとんを跳ね返す
                             bird.rect.move_ip(-bird.vx, -bird.vy)
                             bird.vx *= -0.5
                             bird.vy *= -0.5
-
-                            # 敵を倒した場合
                             if en.hp <= 0:
                                 en.kill()
                                 score += 500
                                 message = "敵を倒した！"
-
                                 enemy_count, boss_spawned, message = spawn_next_enemy(
-                                    enemies,
-                                    enemy_count,
-                                    boss_spawned,
-                                    message,
+                                    enemies, enemy_count, boss_spawned, message
                                 )
-
-                        # 同じフレームで複数の敵に連続ヒットしない
                         break
 
             # 水の球とこうかとんの衝突判定
@@ -647,57 +652,44 @@ def main():
                     reflect_bird_by_wall(bird, wall)
                     sparks.append(Spark(bird.rect.center, life=10))
 
-            # 2体ともHPが0ならゲームオーバー
+            # ゲームオーバー判定
             if all(bird.hp <= 0 for bird in birds):
                 game_clear = True
                 message = "GAME OVER..."
 
-        # --- 描画処理 ---
+        # --- 4. 描画処理 ---
         screen.blit(bg_img, (0, 0))
-
         walls.update(screen)
 
         for i, bird in enumerate(birds):
-            bird.update(
-                screen,
-                is_my_turn=(i == turn_idx and not game_clear),
-            )
+            bird.update(screen, is_my_turn=(i == turn_idx and not game_clear))
 
         enemies.update(screen)
         water_balls.update(screen)
-
-        # HitEffectの更新と描画
         effects.update(screen)
-
-        # Sparkの更新と描画
         sparks = [spark for spark in sparks if spark.update(screen)]
 
         # 敵のHP表示
         for en in enemies:
-            enemy_hp_text = small_font.render(
-                f"HP:{en.hp}",
-                True,
-                (255, 255, 255),
-            )
-            screen.blit(
-                enemy_hp_text,
-                (en.rect.centerx - 25, en.rect.top - 25),
-            )
+            enemy_hp_text = small_font.render(f"HP:{en.hp}", True, (255, 255, 255))
+            screen.blit(enemy_hp_text, (en.rect.centerx - 25, en.rect.top - 25))
 
-        turn_text = font.render(
-            f"現在のターン: {birds[turn_idx].name}",
-            True,
-            COLOR_WHITE,
-        )
+        # 愛情コンボビームの更新と描画
+        for beam in beams[:]:
+            start_pos, end_pos, timer = beam
+            pg.draw.line(screen, (255, 255, 0), start_pos, end_pos, 14)
+            pg.draw.line(screen, (255, 255, 255), start_pos, end_pos, 4)
+            beam[2] -= 1
+            if beam[2] <= 0:
+                beams.remove(beam)
+
+        # UIテキストの描画
+        turn_text = font.render(f"現在のターン: {birds[turn_idx].name}", True, (255, 255, 255))
         screen.blit(turn_text, (20, 20))
 
         score_text = small_font.render(f"SCORE: {score}", True, (255, 255, 255))
         message_text = small_font.render(message, True, (255, 255, 0))
-        hp_text = small_font.render(
-            f"P1 HP:{birds[0].hp}  P2 HP:{birds[1].hp}",
-            True,
-            (255, 255, 255),
-        )
+        hp_text = small_font.render(f"P1 HP:{birds[0].hp}  P2 HP:{birds[1].hp}", True, (255, 255, 255))
 
         screen.blit(score_text, (20, 58))
         screen.blit(message_text, (20, 92))
@@ -705,11 +697,7 @@ def main():
 
         for idx, en in enumerate(enemies):
             remain_sec = en.get_remaining_time() / 1000
-            timer_text = small_font.render(
-                f"敵{idx + 1}: {remain_sec:.1f}s",
-                True,
-                (255, 255, 255),
-            )
+            timer_text = small_font.render(f"敵{idx + 1}: {remain_sec:.1f}s", True, (255, 255, 255))
             screen.blit(timer_text, (WIDTH - 180, 20 + idx * 28))
 
         if game_clear:
