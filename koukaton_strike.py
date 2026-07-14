@@ -39,8 +39,8 @@ class Bird(pg.sprite.Sprite):
         self.is_dragging = False
         self.max_drag_dist = 200  
         self.has_shot = False  # このターンで既に発射されたかどうかのフラグ
-        
-        self.has_triggered_combo = False  # このターンに愛情コンボを発動したか
+
+        self.has_triggered_combo = False  # [追加]このターンに愛情コンボを発動したか
 
     def update(self, screen: pg.Surface, is_my_turn: bool):
         """
@@ -184,7 +184,7 @@ def main():
                     current_bird.vx = -dx * 0.25
                     current_bird.vy = -dy * 0.25
 
-        # --- 【追加】味方同士の衝突判定（友情コンボ） ---
+        # --- 【追加】味方同士の衝突判定（愛情コンボ） ---
         if current_bird.has_shot and not current_bird.has_triggered_combo:
             # もう一方の待機しているこうかとんを取得
             other_bird = birds[1] if turn_idx == 0 else birds[0]
